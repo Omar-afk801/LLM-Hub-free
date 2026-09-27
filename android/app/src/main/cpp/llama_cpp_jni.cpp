@@ -1,5 +1,7 @@
 #include <jni.h>
 #include <android/log.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +17,9 @@
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
-#ifdef LLMHUB_SNAPDRAGON
+#if defined(LLMHUB_VULKAN)
+#define LLAMA_JNI(name) Java_com_llmhub_llmhub_inference_LlamaCppVulkanNative_##name
+#elif defined(LLMHUB_SNAPDRAGON)
 #define LLAMA_JNI(name) Java_com_llmhub_llmhub_inference_LlamaCppSnapdragonNative_##name
 #else
 #define LLAMA_JNI(name) Java_com_llmhub_llmhub_inference_LlamaCppNative_##name
@@ -166,6 +170,13 @@ int decode_tokens(const std::vector<llama_token> & tokens) {
 
 } // namespace
 
+#ifndef LLMHUB_SNAPDRAGON
+extern "C" JNIEXPORT jboolean JNICALL
+LLAMA_JNI(nativeHasIlrcpc)(JNIEnv *, jobject) {
+    return (getauxval(AT_HWCAP) & HWCAP_ILRCPC) != 0 ? JNI_TRUE : JNI_FALSE;
+}
+#endif
+
 extern "C" JNIEXPORT jint JNICALL
 LLAMA_JNI(nativeInit)(JNIEnv * env, jobject, jstring library_dir, jstring htp_dir) {
     if (!g_backend_initialized) {
@@ -184,7 +195,20 @@ LLAMA_JNI(nativeInit)(JNIEnv * env, jobject, jstring library_dir, jstring htp_di
         (void) library_dir;
         (void) htp_dir;
 #endif
+#if !defined(LLMHUB_SNAPDRAGON) && !defined(LLMHUB_VULKAN)
+        // The source build contains Vulkan, but CPU loads must not probe a GPU driver.
+        const char * old_vulkan_setting = std::getenv("GGML_DISABLE_VULKAN");
+        const std::string previous_vulkan_setting = old_vulkan_setting != nullptr ? old_vulkan_setting : "";
+        setenv("GGML_DISABLE_VULKAN", "1", 1);
+#endif
         llama_backend_init();
+#if !defined(LLMHUB_SNAPDRAGON) && !defined(LLMHUB_VULKAN)
+        if (old_vulkan_setting != nullptr) {
+            setenv("GGML_DISABLE_VULKAN", previous_vulkan_setting.c_str(), 1);
+        } else {
+            unsetenv("GGML_DISABLE_VULKAN");
+        }
+#endif
         g_backend_initialized = true;
     }
     return 0;
@@ -198,7 +222,7 @@ LLAMA_JNI(nativeLoadModel)(
     const std::string path = from_jstring(env, model_path);
 
     llama_model_params model_params = llama_model_default_params();
-#ifdef LLMHUB_SNAPDRAGON
+#if defined(LLMHUB_SNAPDRAGON) || defined(LLMHUB_VULKAN)
     const std::string requested_device = from_jstring(env, device_name);
     ggml_backend_dev_t selected_device = ggml_backend_dev_by_name(requested_device.c_str());
     if (selected_device == nullptr) {
@@ -233,7 +257,7 @@ LLAMA_JNI(nativeLoadModel)(
         mtmd_helper_log_set(log_callback, nullptr);
         mtmd_context_params mtmd_params = mtmd_context_params_default();
         mtmd_params.use_gpu = model_params.n_gpu_layers > 0;
-#ifdef LLMHUB_SNAPDRAGON
+#if defined(LLMHUB_SNAPDRAGON) || defined(LLMHUB_VULKAN)
         // Keep the vision encoder on the same explicitly selected accelerator as the text model.
         // Without this, mtmd picks the first GPU backend (often OpenCL even for HTP0 requests).
         mtmd_params.device = selected_device;
@@ -249,6 +273,12 @@ LLAMA_JNI(nativeLoadModel)(
                 mtmd_free(g_mtmd);
                 g_mtmd = nullptr;
             }
+#if defined(LLMHUB_SNAPDRAGON) || defined(LLMHUB_VULKAN)
+            // An accelerator vision failure should trigger the CPU retry, not a
+            // successful but unexpectedly text-only load.
+            unload_model();
+            return 4;
+#endif
         } else {
             __android_log_print(
                 ANDROID_LOG_INFO, TAG, "Loaded vision projector: %s", projector_path.c_str());
